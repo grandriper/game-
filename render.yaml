@@ -1,0 +1,18 @@
+# Deploy to Render.com — HTTPS is automatic on *.onrender.com
+# 1. Push this folder to GitHub (repo root = this folder)
+# 2. Render Dashboard → New → Blueprint → connect repo (uses this file)
+#    OR New Web Service → build: pip install -r requirements-server.txt
+#                        → start: gunicorn server:app --bind 0.0.0.0:$PORT
+# 3. Copy your URL (e.g. https://crown-game.onrender.com) into server_config.json
+
+services:
+  - type: web
+    name: crown-game-server
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-server.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /status
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0

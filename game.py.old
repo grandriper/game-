@@ -1,0 +1,822 @@
+"""
+The Crown of Externality
+=========================
+A fast-paced space dodge-and-shoot game with online leaderboards.
+Music and sprites by Abdallah.
+"""
+
+import pygame
+import random
+import requests
+import sys
+import threading
+import os
+import math
+import json
+from auth import login_flow
+
+pygame.init()
+pygame.mixer.init()
+pygame.mixer.music.set_volume(0.4)
+
+# --- Settings ---
+BASE_URL = 'http://localhost:5000'
+SCORE_URL = f'{BASE_URL}/score'
+LEADERBOARD_URL = f'{BASE_URL}/leaderboard'
+MYSCORE_URL = f'{BASE_URL}/myscore'
+
+WIDTH, HEIGHT = 1200, 800
+screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+pygame.display.set_caption("The Crown of Externality")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont("Arial", 28)
+
+# Colors
+BG       = (15, 15, 30)
+PLAYER   = (0, 220, 255)
+BALL     = (255, 80, 80)
+COIN     = (255, 215, 0)
+WHITE    = (255, 255, 255)
+BULLET   = (180, 255, 180)
+GREEN    = (80, 255, 80)
+RED      = (255, 80, 80)
+
+# --- Safe music helper ---
+def play_music(track):
+    """Switch to a different music track (ignores missing files).
+       0 = menu music, 1 = gameplay music
+    """
+    filename = None
+    if track == 0:
+        filename = "music/start.wav"
+    elif track == 1:
+        filename = "music/game.wav"
+    if filename and os.path.exists(filename):
+        try:
+            pygame.mixer.music.load(filename)
+            pygame.mixer.music.play(-1)
+        except Exception as e:
+            print(f"Could not play {filename}: {e}")
+    else:
+        pygame.mixer.music.stop()
+        if filename:
+            print(f"Music file not found: {filename}")
+
+# --- Procedural starfield ---
+stars = []
+for _ in range(300):
+    speed = random.choice([1, 2, 3])
+    brightness = 150 if speed == 1 else (220 if speed == 2 else 255)
+    stars.append({
+        "x": random.randint(0, WIDTH),
+        "y": random.randint(0, HEIGHT),
+        "speed": speed,
+        "brightness": brightness
+    })
+
+# --- Load common sprites ---
+rock_img = None
+rock_mask = None
+if os.path.exists("rock.png"):
+    try:
+        rock_img = pygame.image.load("rock.png").convert_alpha()
+        rock_img = pygame.transform.scale(rock_img, (20, 32))
+        rock_mask = pygame.mask.from_surface(rock_img)
+        print("OK: rock.png loaded with mask!")
+    except Exception as e:
+        print(f"ERROR loading rock.png: {e}")
+
+start_bg = None
+if os.path.exists("start.png"):
+    try:
+        start_bg = pygame.image.load("start.png").convert()
+        start_bg = pygame.transform.scale(start_bg, (WIDTH, HEIGHT))
+        print("OK: start.png loaded!")
+    except Exception as e:
+        print(f"ERROR loading start.png: {e}")
+
+boss_img = None
+boss_mask = None
+if os.path.exists("boss1.png"):
+    try:
+        boss_img = pygame.image.load("boss1.png").convert_alpha()
+        boss_img = pygame.transform.scale(boss_img, (80, 60))
+        boss_mask = pygame.mask.from_surface(boss_img)
+        print("OK: boss1.png loaded!")
+    except Exception as e:
+        print(f"ERROR loading boss1.png: {e}")
+
+bullet2_img = None
+if os.path.exists("bullet2.png"):
+    try:
+        bullet2_img = pygame.image.load("bullet2.png").convert_alpha()
+        bullet2_img = pygame.transform.scale(bullet2_img, (12, 24))
+        print("OK: bullet2.png loaded!")
+    except Exception as e:
+        print(f"ERROR loading bullet2.png: {e}")
+
+player_bullet_img = None
+if os.path.exists("bullet.png"):
+    try:
+        player_bullet_img = pygame.image.load("bullet.png").convert_alpha()
+        player_bullet_img = pygame.transform.scale(player_bullet_img, (8, 16))
+        print("OK: bullet.png loaded!")
+    except Exception as e:
+        print(f"ERROR loading bullet.png: {e}")
+
+# --- Persistent save / load ---
+SAVE_FILE = "save.json"
+gold = 0
+upgrades = {
+    "speed": {"level": 0, "cost": 100, "effect": 1},
+    "fire_rate": {"level": 0, "cost": 150, "effect": -2},
+    "shield": {"level": 0, "cost": 200, "effect": 1},
+}
+tutorial_done = False
+current_high_score = 0
+
+def save_progress():
+    data = {
+        "gold": gold,
+        "upgrades": upgrades,
+        "high_score": current_high_score,
+        "tutorial_done": tutorial_done
+    }
+    with open(SAVE_FILE, "w") as f:
+        json.dump(data, f)
+
+def load_progress():
+    global gold, upgrades, current_high_score, tutorial_done
+    if os.path.exists(SAVE_FILE):
+        with open(SAVE_FILE, "r") as f:
+            data = json.load(f)
+            gold = data.get("gold", 0)
+            upgrades = data.get("upgrades", {
+                "speed": {"level": 0, "cost": 100, "effect": 1},
+                "fire_rate": {"level": 0, "cost": 150, "effect": -2},
+                "shield": {"level": 0, "cost": 200, "effect": 1},
+            })
+            current_high_score = data.get("high_score", 0)
+            tutorial_done = data.get("tutorial_done", False)
+    else:
+        gold = 0
+        upgrades = {
+            "speed": {"level": 0, "cost": 100, "effect": 1},
+            "fire_rate": {"level": 0, "cost": 150, "effect": -2},
+            "shield": {"level": 0, "cost": 200, "effect": 1},
+        }
+        current_high_score = 0
+        tutorial_done = False
+
+load_progress()
+
+# --- Login ---
+username, token = login_flow(screen, clock, font)
+if username is None:
+    pygame.quit()
+    sys.exit()
+
+play_music(0)   # menu music (if available)
+
+# --- Ship selection ---
+ships = [
+    {"name": "Alpha", "file": "alpha1.png"},
+    {"name": "Beta",  "file": "beta1.png"},
+    {"name": "Pie",   "file": "pie1.png"},
+]
+chosen_ship = 0
+
+choosing = True
+while choosing:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            pygame.quit(); sys.exit()
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_1: chosen_ship = 0; choosing = False
+            if event.key == pygame.K_2: chosen_ship = 1; choosing = False
+            if event.key == pygame.K_3: chosen_ship = 2; choosing = False
+
+    if start_bg:
+        screen.blit(start_bg, (0, 0))
+    else:
+        screen.fill(BG)
+    title = font.render("CHOOSE YOUR SHIP", True, WHITE)
+    screen.blit(title, (WIDTH//2 - 120, HEIGHT//2 - 100))
+    for i, ship in enumerate(ships):
+        txt = font.render(f"Press {i+1} for {ship['name']}", True, WHITE)
+        screen.blit(txt, (WIDTH//2 - 120, HEIGHT//2 + i*40))
+    pygame.display.flip()
+    clock.tick(60)
+
+# --- Load chosen ship sprites & masks ---
+player_img = None
+player_shield_img = None
+player_mask = None
+player_shield_mask = None
+# Animation frames (to be filled later)
+player_anim_frames = []
+player_shield_anim_frames = []
+anim_timer = 0
+anim_index = 0
+ANIM_SPEED = 10
+
+# Hitbox dimensions (tight, 180x120 inside 200x140 sprite)
+HITBOX_W = 180
+HITBOX_H = 120
+OFFSET_X = 10
+OFFSET_Y = 10
+
+ship_path = ships[chosen_ship]["file"]               # e.g. "alpha1.png"
+base_path = ship_path.replace("1.png", ".png")       # "alpha.png"
+
+# Load unshielded sprite (normal)
+if os.path.exists(base_path):
+    try:
+        player_img = pygame.image.load(base_path).convert_alpha()
+        player_img = pygame.transform.scale(player_img, (200, 140))
+        print(f"OK: {ships[chosen_ship]['name']} base loaded!")
+    except Exception as e:
+        print(f"ERROR loading {base_path}: {e}")
+        player_img = None
+
+# Load shielded sprite
+if os.path.exists(ship_path):
+    try:
+        player_shield_img = pygame.image.load(ship_path).convert_alpha()
+        player_shield_img = pygame.transform.scale(player_shield_img, (200, 140))
+        print(f"OK: {ships[chosen_ship]['name']} shield loaded!")
+    except Exception as e:
+        print(f"ERROR loading {ship_path}: {e}")
+        player_shield_img = None
+
+# Create masks
+if player_img:
+    player_mask = pygame.mask.from_surface(player_img)
+if player_shield_img:
+    player_shield_mask = pygame.mask.from_surface(player_shield_img)
+
+# ── ANIMATION SETUP (FUTURE) ─────────────────────────────────────────
+# To enable animation, create a "sprites" folder and put frames like:
+#   sprites/alpha_idle1.png, alpha_idle2.png, ...
+#   sprites/alpha_shield1.png, alpha_shield2.png, ...
+# Then replace the single image loads above with a loop that loads each
+# frame into player_anim_frames / player_shield_anim_frames.
+# Uncomment the lines below when you have the files ready.
+#
+# EXAMPLE (for Alpha):
+# for i in range(1, 3):  # two idle frames
+#     frame = pygame.image.load(f"sprites/alpha_idle{i}.png").convert_alpha()
+#     frame = pygame.transform.scale(frame, (200, 140))
+#     player_anim_frames.append(frame)
+# for i in range(1, 3):  # two shielded frames
+#     frame = pygame.image.load(f"sprites/alpha_shield{i}.png").convert_alpha()
+#     frame = pygame.transform.scale(frame, (200, 140))
+#     player_shield_anim_frames.append(frame)
+
+# --- Pixel‑perfect collision helper ---
+def player_hit_enemy(rect, enemy_mask=None):
+    # Choose the right mask based on shield
+    mask = player_shield_mask if (shield_hp > 0 and player_shield_mask) else player_mask
+    if not mask:
+        return rect.colliderect(player)
+    sprite_x = player.x - OFFSET_X
+    sprite_y = player.y - OFFSET_Y
+    if enemy_mask:
+        offset_x = rect.x - sprite_x
+        offset_y = rect.y - sprite_y
+        return mask.overlap(enemy_mask, (offset_x, offset_y)) is not None
+    else:
+        temp_surf = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+        temp_surf.fill((255, 255, 255, 255))
+        temp_mask = pygame.mask.from_surface(temp_surf)
+        offset_x = rect.x - sprite_x
+        offset_y = rect.y - sprite_y
+        return mask.overlap(temp_mask, (offset_x, offset_y)) is not None
+
+# --- Network data ---
+leaderboard_data = []
+my_score_data = {"score": 0, "gold": 0}
+
+# --- Threaded network functions ---
+def send_score_and_gold(new_score):
+    def send():
+        try:
+            requests.post(SCORE_URL,
+                          json={'score': new_score, 'gold': gold},
+                          headers={'Authorization': f'Bearer {token}'},
+                          timeout=3)
+        except:
+            pass
+    if token:
+        threading.Thread(target=send, daemon=True).start()
+
+def fetch_leaderboard():
+    def fetch():
+        global leaderboard_data
+        try:
+            resp = requests.get(LEADERBOARD_URL, timeout=3)
+            if resp.status_code == 200:
+                leaderboard_data = resp.json().get('leaderboard', [])
+        except:
+            pass
+    threading.Thread(target=fetch, daemon=True).start()
+
+def fetch_my_score():
+    global my_score_data
+    def fetch():
+        try:
+            resp = requests.get(MYSCORE_URL,
+                                headers={'Authorization': f'Bearer {token}'},
+                                timeout=3)
+            if resp.status_code == 200:
+                my_score_data = resp.json()
+        except:
+            pass
+    threading.Thread(target=fetch, daemon=True).start()
+
+fetch_leaderboard()
+fetch_my_score()
+
+# --- Shop system ---
+def buy_upgrade(upg_key):
+    global gold, upgrades, player_speed, SHOOT_DELAY, shield_hp
+    upg = upgrades[upg_key]
+    level = upg["level"]
+    cost = upg["cost"] * (level + 1)
+    if gold >= cost:
+        gold -= cost
+        upg["level"] += 1
+        if upg_key == "speed":
+            player_speed = 8 + upgrades["speed"]["level"] * upgrades["speed"]["effect"]
+        elif upg_key == "fire_rate":
+            SHOOT_DELAY = 12 + upgrades["fire_rate"]["level"] * upgrades["fire_rate"]["effect"]
+        elif upg_key == "shield":
+            shield_hp = upgrades["shield"]["level"]
+        save_progress()
+        return True
+    return False
+
+def shop_screen():
+    global gold, upgrades, player_speed, SHOOT_DELAY, shield_hp
+    shopping = True
+    while shopping:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    shopping = False
+                if event.key == pygame.K_1:
+                    buy_upgrade("speed")
+                if event.key == pygame.K_2:
+                    buy_upgrade("fire_rate")
+                if event.key == pygame.K_3:
+                    buy_upgrade("shield")
+
+        if start_bg:
+            screen.blit(start_bg, (0, 0))
+        else:
+            screen.fill(BG)
+        title = font.render("SHOP (press ENTER to start game)", True, WHITE)
+        screen.blit(title, (WIDTH//2 - 250, 50))
+        gold_text = font.render(f"Gold: {gold}", True, COIN)
+        screen.blit(gold_text, (WIDTH - 200, 50))
+
+        y = 150
+        for key, upg in upgrades.items():
+            name = key.replace("_", " ").title()
+            level = upg["level"]
+            cost = upg["cost"] * (level + 1)
+            txt = font.render(f"[{['1','2','3'][list(upgrades.keys()).index(key)]}] {name}  Lv.{level} → {level+1}  Cost: {cost}", True, WHITE)
+            screen.blit(txt, (200, y))
+            y += 50
+
+        controls = font.render("Press ENTER/ESC to start | 1/2/3 to buy upgrade", True, WHITE)
+        screen.blit(controls, (WIDTH//2 - 300, y + 50))
+        pygame.display.flip()
+        clock.tick(60)
+
+play_music(0)   # menu music for shop
+shop_screen()
+
+# --- Apply upgrades after shop ---
+player_speed = 8 + upgrades["speed"]["level"] * upgrades["speed"]["effect"]
+SHOOT_DELAY = 12 + upgrades["fire_rate"]["level"] * upgrades["fire_rate"]["effect"]
+shield_hp = upgrades["shield"]["level"]
+shield_max = shield_hp
+
+# --- Tutorial (one‑time) ---
+if not tutorial_done:
+    tutorial_steps = [
+        "MOVE: LEFT / RIGHT arrows",
+        "SHOOT: SPACE",
+        "TEST BOSS: B (dev key)",
+        "RESTART: R after game over",
+        "MARKET: M after game over",
+        "HITBOXES: H to toggle",
+        "LEADERBOARD: L to view",
+        "Press ENTER to start"
+    ]
+    waiting = True
+    while waiting:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN:
+                    waiting = False
+        dark = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        dark.fill((0, 0, 0, 180))
+        screen.blit(dark, (0, 0))
+        y = 200
+        for line in tutorial_steps:
+            txt = font.render(line, True, WHITE)
+            screen.blit(txt, (WIDTH//2 - 150, y))
+            y += 50
+        pygame.display.flip()
+        clock.tick(60)
+    tutorial_done = True
+    save_progress()
+
+# --- Game objects ---
+player = pygame.Rect(0, 0, HITBOX_W, HITBOX_H)
+player.center = (WIDTH//2, HEIGHT - 100)  # correct vertical position
+bullets = []
+bullet_speed = 7
+shoot_cooldown = 0
+rocks = []
+score = 0
+spawn_timer = 0
+game_over = False
+show_hitboxes = False
+show_leaderboard = False
+last_level = 1
+
+play_music(1)   # gameplay music
+
+def spawn_rock(score):
+    x = random.randint(20, WIDTH - 20)
+    level_bonus = (score // 300) * 0.8
+    if random.random() < 0.25:
+        hp = 2
+        color = BALL
+        speed = random.uniform(2, 4) + level_bonus
+    else:
+        hp = 1
+        color = (120, 220, 255)
+        speed = random.uniform(4, 8) + level_bonus
+    rocks.append({"rect": pygame.Rect(x, -32, 20, 32),
+                  "speed": speed, "hp": hp, "color": color})
+
+# --- Boss system ---
+boss = None
+boss_bullets = []
+boss_levels = [3, 6, 9, 12, 15]
+next_boss_idx = 0
+boss_active = False
+boss_defeated_score = 500
+
+def spawn_boss(level):
+    boss_num = (level - 3) // 3 + 1
+    hp = 10 + (boss_num - 1) * 5
+    speed = 2 + boss_num
+    shoot_delay = max(30, 60 - boss_num * 5)
+    spread_count = 3 + boss_num - 1
+    rect = pygame.Rect(WIDTH//2 - 40, 20, 80, 60)
+    return {
+        "rect": rect,
+        "hp": hp,
+        "max_hp": hp,
+        "speed": speed,
+        "shoot_delay": shoot_delay,
+        "shoot_timer": 0,
+        "direction": 1,
+        "spread_count": spread_count,
+    }
+
+def boss_shoot(boss):
+    cx = boss["rect"].centerx
+    cy = boss["rect"].bottom
+    count = boss["spread_count"]
+    spread_angle = 30
+    for i in range(count):
+        angle = -spread_angle/2 + i * spread_angle / max(1, count-1)
+        rad = math.radians(angle)
+        vx = math.sin(rad) * 4
+        vy = math.cos(rad) * 5
+        boss_bullets.append({
+            "rect": pygame.Rect(cx - 6, cy, 12, 24),
+            "vx": vx,
+            "vy": vy
+        })
+
+running = True
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_h:
+                show_hitboxes = not show_hitboxes
+            if event.key == pygame.K_l:
+                show_leaderboard = not show_leaderboard
+                if show_leaderboard:
+                    fetch_leaderboard()
+                    fetch_my_score()
+            if event.key == pygame.K_b and not boss and not game_over:
+                level = 1 + score // 300
+                boss = spawn_boss(level)
+                boss_active = True
+            if game_over and event.key == pygame.K_r:
+                rocks.clear()
+                bullets.clear()
+                boss = None
+                boss_bullets.clear()
+                boss_active = False
+                next_boss_idx = 0
+                score = 0
+                player.center = (WIDTH//2, HEIGHT - 100)
+                game_over = False
+                last_level = 1
+                shield_hp = shield_max
+                fetch_leaderboard()
+                fetch_my_score()
+                play_music(1)
+            if game_over and event.key == pygame.K_m:
+                save_progress()
+                play_music(0)
+                shop_screen()
+                rocks.clear()
+                bullets.clear()
+                boss = None
+                boss_bullets.clear()
+                boss_active = False
+                next_boss_idx = 0
+                score = 0
+                player.center = (WIDTH//2, HEIGHT - 100)
+                game_over = False
+                last_level = 1
+                shield_hp = shield_max
+                fetch_leaderboard()
+                fetch_my_score()
+                player_speed = 8 + upgrades["speed"]["level"] * upgrades["speed"]["effect"]
+                SHOOT_DELAY = 12 + upgrades["fire_rate"]["level"] * upgrades["fire_rate"]["effect"]
+                shield_hp = upgrades["shield"]["level"]
+                shield_max = shield_hp
+                play_music(1)
+            if event.key == pygame.K_SPACE and shoot_cooldown == 0 and not game_over:
+                bullets.append(pygame.Rect(player.centerx - 4, player.top - 16, 8, 16))
+                shoot_cooldown = SHOOT_DELAY
+
+    if shoot_cooldown > 0:
+        shoot_cooldown -= 1
+
+    if not game_over and not show_leaderboard:
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_LEFT] and player.left > 0:
+            player.x -= player_speed
+        if keys[pygame.K_RIGHT] and player.right < WIDTH:
+            player.x += player_speed
+
+        spawn_timer += 1
+        if spawn_timer > max(15, 40 - (score // 300) * 5):
+            spawn_rock(score)
+            spawn_timer = 0
+
+        for rock in rocks[:]:
+            rock["rect"].y += rock["speed"]
+            if rock["rect"].top > HEIGHT:
+                rocks.remove(rock)
+                score += 1
+            elif player_hit_enemy(rock["rect"], rock_mask):
+                if shield_hp > 0:
+                    shield_hp -= 1
+                    rocks.remove(rock)
+                else:
+                    game_over = True
+                    send_score_and_gold(score)
+                    fetch_leaderboard()
+                    fetch_my_score()
+
+        level = 1 + score // 300
+        if not boss and next_boss_idx < len(boss_levels) and level >= boss_levels[next_boss_idx]:
+            boss = spawn_boss(level)
+            boss_active = True
+            next_boss_idx += 1
+
+        if boss:
+            boss["rect"].x += boss["speed"] * boss["direction"]
+            if boss["rect"].right >= WIDTH or boss["rect"].left <= 0:
+                boss["direction"] *= -1
+
+            boss["shoot_timer"] += 1
+            if boss["shoot_timer"] >= boss["shoot_delay"]:
+                boss_shoot(boss)
+                boss["shoot_timer"] = 0
+
+            for b in boss_bullets[:]:
+                b["rect"].x += b["vx"]
+                b["rect"].y += b["vy"]
+                if b["rect"].top > HEIGHT or b["rect"].right < 0 or b["rect"].left > WIDTH:
+                    boss_bullets.remove(b)
+                    continue
+                if player_hit_enemy(b["rect"]):
+                    if shield_hp > 0:
+                        shield_hp -= 1
+                        boss_bullets.remove(b)
+                    else:
+                        game_over = True
+                        send_score_and_gold(score)
+                        fetch_leaderboard()
+                        fetch_my_score()
+                        break
+
+            for bullet in bullets[:]:
+                if bullet.colliderect(boss["rect"]):
+                    bullets.remove(bullet)
+                    boss["hp"] -= 1
+                    if boss["hp"] <= 0:
+                        score += boss_defeated_score
+                        gold += 100
+                        boss = None
+                        boss_bullets.clear()
+                        boss_active = False
+                        break
+
+            if boss and player_hit_enemy(boss["rect"], boss_mask):
+                if shield_hp > 0:
+                    shield_hp -= 1
+                else:
+                    game_over = True
+                    send_score_and_gold(score)
+                    fetch_leaderboard()
+                    fetch_my_score()
+
+        for bullet in bullets[:]:
+            bullet.y -= bullet_speed
+            if bullet.bottom < 0:
+                bullets.remove(bullet)
+                continue
+            for rock in rocks[:]:
+                if bullet.colliderect(rock["rect"]):
+                    bullets.remove(bullet)
+                    rock["hp"] -= 1
+                    if rock["hp"] <= 0:
+                        rocks.remove(rock)
+                        score += 1
+                        gold += 10
+                    break
+
+        if score > current_high_score:
+            current_high_score = score
+
+        # --- Animation update (when frames exist) ---
+        if player_anim_frames:
+            anim_timer += 1
+            if anim_timer >= ANIM_SPEED:
+                anim_timer = 0
+                anim_index = (anim_index + 1) % len(player_anim_frames)
+
+    # ── Drawing ──────────────────────────────
+    screen.fill((0, 0, 0))
+    for star in stars:
+        star["y"] += star["speed"]
+        if star["y"] > HEIGHT:
+            star["y"] = 0
+            star["x"] = random.randint(0, WIDTH)
+        b = star["brightness"]
+        size = star["speed"]
+        pygame.draw.rect(screen, (b, b, b), (star["x"], star["y"], size, size))
+
+    # Player drawing with shield logic
+    if shield_hp > 0 and player_shield_img:
+        if player_shield_anim_frames:
+            current_sprite = player_shield_anim_frames[anim_index % len(player_shield_anim_frames)]
+        else:
+            current_sprite = player_shield_img
+    elif player_img:
+        if player_anim_frames:
+            current_sprite = player_anim_frames[anim_index % len(player_anim_frames)]
+        else:
+            current_sprite = player_img
+    else:
+        current_sprite = None
+
+    if current_sprite:
+        screen.blit(current_sprite, (player.x - OFFSET_X, player.y - OFFSET_Y))
+    else:
+        pygame.draw.rect(screen, PLAYER, player, border_radius=8)
+
+    # Shield circle only in hitbox mode
+    if shield_hp > 0 and show_hitboxes:
+        pygame.draw.circle(screen, (0, 100, 255), player.center, 30, 3)
+
+    # Rocks
+    for rock in rocks:
+        if rock_img:
+            screen.blit(rock_img, rock["rect"])
+        else:
+            pygame.draw.ellipse(screen, rock["color"], rock["rect"])
+        if rock["hp"] > 1:
+            hp_surf = font.render(str(rock["hp"]), True, WHITE)
+            screen.blit(hp_surf, hp_surf.get_rect(center=rock["rect"].center))
+
+    # Boss
+    if boss:
+        if boss_img:
+            screen.blit(boss_img, boss["rect"])
+        else:
+            pygame.draw.rect(screen, RED, boss["rect"])
+        bar_width = 80
+        bar_height = 6
+        health_ratio = boss["hp"] / boss["max_hp"]
+        pygame.draw.rect(screen, RED, (boss["rect"].x, boss["rect"].top - 10, bar_width, bar_height))
+        pygame.draw.rect(screen, GREEN, (boss["rect"].x, boss["rect"].top - 10, bar_width * health_ratio, bar_height))
+
+    # Boss bullets
+    for b in boss_bullets:
+        if bullet2_img:
+            screen.blit(bullet2_img, b["rect"])
+        else:
+            pygame.draw.rect(screen, (255, 100, 0), b["rect"])
+
+    # Player bullets
+    for bullet in bullets:
+        if player_bullet_img:
+            screen.blit(player_bullet_img, bullet)
+        else:
+            pygame.draw.rect(screen, BULLET, bullet)
+
+    # Debug hitboxes
+    if show_hitboxes:
+        pygame.draw.rect(screen, GREEN, player, 2)
+        for rock in rocks:
+            pygame.draw.rect(screen, RED, rock["rect"], 2)
+        if boss:
+            pygame.draw.rect(screen, (255, 0, 255), boss["rect"], 2)
+        for b in boss_bullets:
+            pygame.draw.rect(screen, (255, 100, 0), b["rect"], 2)
+
+    # HUD
+    score_surf = font.render(f"Score: {score}", True, COIN)
+    screen.blit(score_surf, (10, 10))
+    gold_surf = font.render(f"Gold: {gold}", True, COIN)
+    screen.blit(gold_surf, (10, 50))
+    user_surf = font.render(f"Player: {username}", True, WHITE)
+    screen.blit(user_surf, (10, 90))
+    high_surf = font.render(f"High Score: {current_high_score}", True, WHITE)
+    screen.blit(high_surf, (10, 130))
+    level = 1 + score // 300
+    level_surf = font.render(f"Level: {level}", True, WHITE)
+    screen.blit(level_surf, (10, 170))
+    if shield_hp > 0:
+        shield_surf = font.render(f"Shield: {shield_hp}", True, (0, 100, 255))
+        screen.blit(shield_surf, (10, 210))
+
+    # Leaderboard overlay
+    if show_leaderboard:
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        screen.blit(overlay, (0, 0))
+
+        lb_title = font.render("GLOBAL TOP 10", True, COIN)
+        screen.blit(lb_title, (WIDTH//2 - lb_title.get_width()//2, 50))
+
+        header = font.render("Rank  Player          Score      Gold", True, WHITE)
+        screen.blit(header, (WIDTH//2 - 250, 100))
+
+        y = 140
+        for i, entry in enumerate(leaderboard_data):
+            text = font.render(
+                f"{i+1:<5} {entry['username']:<15} {entry['score']:<10} {entry.get('gold', 0)}",
+                True, WHITE
+            )
+            screen.blit(text, (WIDTH//2 - 250, y))
+            y += 30
+
+        y += 20
+        my_header = font.render("Your Stats:", True, COIN)
+        screen.blit(my_header, (WIDTH//2 - 250, y))
+        y += 30
+        my_text = font.render(
+            f"Score: {my_score_data['score']}   Gold: {my_score_data['gold']}",
+            True, WHITE
+        )
+        screen.blit(my_text, (WIDTH//2 - 250, y))
+        y += 40
+
+        hint = font.render("Press L to close", True, WHITE)
+        screen.blit(hint, (WIDTH//2 - 80, y))
+
+    controls_surf = font.render("LEFT/RIGHT move  SPACE shoot  B boss  R restart  M market  H hitboxes  L leaderboard", True, WHITE)
+    screen.blit(controls_surf, (10, HEIGHT - 40))
+
+    if game_over:
+        save_progress()
+        go = font.render("GAME OVER! Press R to restart, M for market", True, BALL)
+        screen.blit(go, go.get_rect(center=(WIDTH//2, HEIGHT//2)))
+
+    pygame.display.flip()
+    clock.tick(60)
+
+pygame.quit()
